@@ -100,6 +100,54 @@ except ImportError:
     CURVE = PurePython_SECP256k1()
 
 
+def worker_process_wrapper(args_str):
+    """Wrapper function for worker process that handles string conversion"""
+    # Parse arguments from string
+    parts = args_str.split('|')
+    start_k = int(parts[0])
+    chunk_size = int(parts[1])
+    target_r = int(parts[2])
+    worker_id = int(parts[3])
+    
+    logger.debug(f"Worker {worker_id} starting with range: {start_k} to {start_k + chunk_size - 1}")
+    
+    # Use the appropriate curve implementation
+    if USING_FASTECDSA:
+        n = CURVE.q
+    else:
+        n = CURVE.n
+    
+    # Manual iteration to avoid range() with large numbers
+    k = start_k
+    end_k = start_k + chunk_size
+    
+    while k < end_k:
+        try:
+            # Calculate r value
+            if USING_FASTECDSA:
+                point = k * CURVE.G
+                calculated_r = point.x % n
+            else:
+                G_point = (CURVE.Gx, CURVE.Gy)
+                point = CURVE.scalar_mult(k, G_point)
+                if point is None:
+                    calculated_r = None
+                else:
+                    calculated_r = point[0] % n
+            
+            # Check if the r value matches
+            if calculated_r == target_r:
+                return str(k)  # Return as string
+                
+        except Exception as e:
+            logger.debug(f"Worker {worker_id} error at k=0x{k:x}: {e}")
+        
+        k += 1
+    
+    # No match found
+    return None
+
+
 class NonceRecoveryTool:
     """ECDSA nonce (k) recovery tool that uses brute force to find the nonce used in signature generation."""
     
@@ -147,13 +195,31 @@ class NonceRecoveryTool:
         """Load previous state from checkpoint files."""
         k_guess = self.k_start
         
+        # Clean up any corrupt checkpoint files
+        for filename in [self.previous_guesses_file, self.last_guess_file]:
+            if os.path.exists(filename):
+                try:
+                    with open(filename, 'r') as f:
+                        content = f.read()
+                        # Check if file contains non-numeric data
+                        if filename == self.last_guess_file:
+                            if not content.strip().isdigit():
+                                logger.warning(f"Corrupt checkpoint file {filename}, removing...")
+                                os.remove(filename)
+                except Exception as e:
+                    logger.warning(f"Error reading {filename}: {e}")
+                    if os.path.exists(filename):
+                        os.remove(filename)
+        
         # Load previous guesses
         if os.path.exists(self.previous_guesses_file):
             try:
                 with open(self.previous_guesses_file, 'r') as f:
                     for line in f:
                         try:
-                            self.previous_guesses.add(int(line.strip()))
+                            value = line.strip()
+                            if value and value.isdigit():
+                                self.previous_guesses.add(int(value))
                         except ValueError:
                             continue  # Skip invalid lines
                 logger.info(f"Loaded {len(self.previous_guesses):,} previous guesses")
@@ -164,8 +230,10 @@ class NonceRecoveryTool:
         if os.path.exists(self.last_guess_file):
             try:
                 with open(self.last_guess_file, 'r') as f:
-                    k_guess = int(f.read().strip())
-                logger.info(f"Resuming from checkpoint: 0x{k_guess:x}")
+                    content = f.read().strip()
+                    if content and content.isdigit():
+                        k_guess = int(content)
+                        logger.info(f"Resuming from checkpoint: 0x{k_guess:x}")
             except (ValueError, IOError) as e:
                 logger.warning(f"Error loading checkpoint, using start value: {e}")
         
@@ -177,9 +245,10 @@ class NonceRecoveryTool:
             with open(self.last_guess_file, 'w') as f:
                 f.write(str(k_guess))
             
-            with open(self.previous_guesses_file, 'a') as f:
-                for guess in new_guesses:
-                    f.write(f"{guess}\n")
+            if new_guesses:
+                with open(self.previous_guesses_file, 'a') as f:
+                    for guess in new_guesses:
+                        f.write(f"{guess}\n")
             
             logger.debug(f"Checkpoint saved at k=0x{k_guess:x}")
         except Exception as e:
@@ -207,27 +276,6 @@ class NonceRecoveryTool:
             if point is None:
                 return None
             return point[0] % self.n
-    
-    def _worker_process(self, start_k, chunk_size, result_queue, worker_id):
-        """Worker process for parallel nonce testing."""
-        logger.debug(f"Worker {worker_id} starting with range: {start_k} to {start_k + chunk_size - 1}")
-        
-        for k in range(start_k, start_k + chunk_size):
-            try:
-                # Calculate r value directly using point multiplication
-                calculated_r = self._calculate_r_value(k)
-                
-                # Check if the r value matches
-                if calculated_r == self.r:
-                    result_queue.put(k)
-                    return
-                    
-            except Exception as e:
-                logger.debug(f"Worker {worker_id} error at k=0x{k:x}: {e}")
-        
-        # No match found in this chunk
-        result_queue.put(None)
-        logger.debug(f"Worker {worker_id} completed without finding match")
     
     def recover(self, use_multiprocessing=True, num_processes=None, chunk_size=1000):
         """
@@ -266,12 +314,13 @@ class NonceRecoveryTool:
         new_guesses = set()
         
         # Print initial status line
-        print("Initializing nonce recovery tool...", end="\r", flush=True)
+        sys.stdout.write("Initializing nonce recovery tool...")
+        sys.stdout.flush()
         
         # For parallel execution
         if use_multiprocessing and mp.cpu_count() > 1:
             if num_processes is None:
-                num_processes = 16  # Default to 16 processes
+                num_processes = 8  # Default to 8 processes
             
             logger.info(f"Using {num_processes} processes for parallel nonce recovery")
             
@@ -281,100 +330,89 @@ class NonceRecoveryTool:
             test_r = self._calculate_r_value(test_k)
             logger.info(f"Test k=1 produces r=0x{test_r:x}")
             
-            while True:
-                # Create chunks of work
-                chunks = []
-                current_k = k_guess
-                
-                # Create a result queue
-                result_queue = mp.Queue()
-                processes = []
-                
-                for i in range(num_processes):
-                    # Skip values we've already checked
-                    while current_k in self.previous_guesses:
-                        current_k += 1
+            # Create pool
+            with mp.Pool(processes=num_processes) as pool:
+                while k_guess < self.n:
+                    # Create work chunks
+                    work_items = []
+                    current_k = k_guess
                     
-                    # Create and start worker process
-                    p = mp.Process(
-                        target=self._worker_process,
-                        args=(current_k, chunk_size, result_queue, i)
-                    )
-                    processes.append((p, current_k))
-                    p.start()
-                    
-                    # Next chunk starts after this one
-                    current_k += chunk_size
-                
-                # Wait for results
-                found_nonce = None
-                completed_processes = 0
-                
-                while completed_processes < len(processes):
-                    try:
-                        result = result_queue.get(timeout=5)  # 5 second timeout
-                        completed_processes += 1
+                    for i in range(num_processes):
+                        # Skip values we've already checked
+                        while current_k in self.previous_guesses and current_k < self.n:
+                            current_k += 1
                         
-                        if result is not None:
-                            found_nonce = result
+                        if current_k >= self.n:
                             break
+                        
+                        # Create work item as string to avoid serialization issues
+                        work_item = f"{current_k}|{chunk_size}|{self.r}|{i}"
+                        work_items.append(work_item)
+                        current_k += chunk_size
+                    
+                    if not work_items:
+                        break
+                    
+                    # Process chunks in parallel
+                    try:
+                        results = pool.map(worker_process_wrapper, work_items)
+                        
+                        # Check results
+                        for result in results:
+                            if result is not None:
+                                found_nonce = int(result)
+                                # Print a newline to clear the status line
+                                sys.stdout.write("\n")
+                                sys.stdout.flush()
+                                
+                                total_elapsed = time.time() - start_time
+                                logger.info(f"SUCCESS! Nonce found after {total_guesses:,} operations ({timedelta(seconds=int(total_elapsed))})")
+                                logger.info(f"Recovered nonce (k): 0x{found_nonce:x}")
+                                logger.info(f"Decimal value: {found_nonce}")
+                                self._save_result(found_nonce)
+                                return found_nonce
+                    
                     except Exception as e:
-                        logger.warning(f"Error getting result from queue: {e}")
-                        # Continue waiting for other processes
-                
-                # If we found a match, we're done
-                if found_nonce is not None:
-                    # Clean up processes
-                    for p, _ in processes:
-                        p.terminate()
+                        logger.error(f"Error in parallel processing: {e}")
+                        break
                     
-                    # Print a newline to clear the status line
-                    print()
+                    # Update counters and progress
+                    total_checked = len(work_items) * chunk_size
+                    total_guesses += total_checked
+                    k_guess = current_k
                     
-                    total_elapsed = time.time() - start_time
-                    logger.info(f"SUCCESS! Nonce found after {total_guesses:,} operations ({timedelta(seconds=int(total_elapsed))})")
-                    logger.info(f"Recovered nonce (k): 0x{found_nonce:x}")
-                    logger.info(f"Decimal value: {found_nonce}")
-                    self._save_result(found_nonce)
-                    return found_nonce
-                
-                # Clean up processes
-                for p, _ in processes:
-                    p.terminate()
-                    p.join(timeout=1)  # Wait for 1 second for process to terminate
-                
-                # Update counters and progress
-                total_checked = sum(chunk_size for _, _ in processes)
-                total_guesses += total_checked
-                k_guess = current_k
-                
-                # Update progress with carriage return printing
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    rate = total_guesses / elapsed
-                    estimated_time = "Unknown"
-                    if rate > 0:
-                        # Very crude estimate (assumes linear search space)
-                        remaining_iterations = min(2**32, self.n) - k_guess
-                        estimated_seconds = remaining_iterations / rate
-                        if estimated_seconds < 60 * 60 * 24 * 365 * 100:  # If less than 100 years
-                            estimated_time = str(timedelta(seconds=int(estimated_seconds)))
+                    # Update progress with carriage return printing
+                    elapsed = time.time() - start_time
+                    if elapsed > 0:
+                        rate = total_guesses / elapsed
+                        estimated_time = "Unknown"
+                        if rate > 0:
+                            # Calculate remaining iterations
+                            remaining = self.n - k_guess
+                            if remaining > 0:
+                                estimated_seconds = remaining / rate
+                                if estimated_seconds < 60 * 60 * 24 * 365 * 100:  # Less than 100 years
+                                    estimated_time = str(timedelta(seconds=int(estimated_seconds)))
+                                else:
+                                    estimated_time = ">100 years"
+                        
+                        # Use carriage return to update in place - pad with spaces to clear previous text
+                        status = f"\rProgress: Testing near 0x{k_guess:x} | {rate:,.2f} keys/sec | Est. time: {estimated_time:<20} | Total: {total_guesses:,}"
+                        sys.stdout.write(status)
+                        sys.stdout.flush()
                     
-                    # Use carriage return to update in place
-                    status = f"Progress: Testing near 0x{k_guess:x} | {rate:,.2f} keys/sec | Est. time: {estimated_time} | Total: {total_guesses:,}      "
-                    print(status, end="\r", flush=True)
-                
-                # Save checkpoint periodically
-                self._save_checkpoint(k_guess, new_guesses)
-                new_guesses.clear()
-                
-                # Small delay to prevent CPU overload
-                time.sleep(0.1)
+                    # Save checkpoint periodically
+                    self._save_checkpoint(k_guess, new_guesses)
+                    new_guesses.clear()
+                    
+                    # Small delay to prevent CPU overload
+                    time.sleep(0.01)
         
         # Sequential execution
         else:
             logger.info("Using sequential (single-process) execution")
-            print("Starting sequential search...", end="\r", flush=True)
+            sys.stdout.write("\rStarting sequential search...")
+            sys.stdout.flush()
             
             while k_guess < self.n:  # Stop at curve order
                 # Skip values we've already checked
@@ -389,7 +427,8 @@ class NonceRecoveryTool:
                     # Check if the r value matches
                     if calculated_r == self.r:
                         # Print a newline to clear the status line
-                        print()
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
                         
                         total_elapsed = time.time() - start_time
                         logger.info(f"SUCCESS! Nonce found after {total_guesses:,} operations ({timedelta(seconds=int(total_elapsed))})")
@@ -416,8 +455,9 @@ class NonceRecoveryTool:
                     if elapsed > 0:
                         rate = counter / elapsed
                         # Use carriage return to update in place
-                        status = f"Progress: Testing 0x{k_guess:x} | {rate:,.2f} keys/sec | Completed: {total_guesses:,}        "
-                        print(status, end="\r", flush=True)
+                        status = f"\rProgress: Testing 0x{k_guess:x} | {rate:,.2f} keys/sec | Completed: {total_guesses:,}"
+                        sys.stdout.write(status + " " * 20)  # Add spaces to clear any remaining text
+                        sys.stdout.flush()
                     
                     counter = 0
                     start_time = time.time()
@@ -428,6 +468,8 @@ class NonceRecoveryTool:
                 if counter % 10000 == 0:
                     time.sleep(0.001)
         
+        sys.stdout.write("\n")
+        sys.stdout.flush()
         logger.error("Nonce recovery failed - reached end of search space")
         return None
 
@@ -457,7 +499,7 @@ def main():
     parser.add_argument("--z", type=str, required=True, help="Message hash (hex)")
     parser.add_argument("--start", type=str, default="1", help="Starting value for brute force (hex or decimal)")
     parser.add_argument("--parallel", action="store_true", help="Use parallel processing")
-    parser.add_argument("--processes", type=int, default=16, help="Number of processes to use (default: 16)")
+    parser.add_argument("--processes", type=int, default=8, help="Number of processes to use (default: 8)")
     parser.add_argument("--chunk-size", type=int, default=1000, help="Chunk size for parallel processing")
     parser.add_argument("--checkpoint-interval", type=int, default=1000, help="How often to save progress")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
@@ -476,7 +518,7 @@ def main():
     
     try:
         # Create tool and run recovery
-        tool = NonceRecoveryTool(r, s, z, k_start)
+        tool = NonceRecoveryTool(r, s, z, k_start, checkpoint_interval=args.checkpoint_interval)
         result = tool.recover(
             use_multiprocessing=args.parallel,
             num_processes=args.processes,
